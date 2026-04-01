@@ -524,10 +524,13 @@ async function main() {
 
   var inference = inferOperator(safe, validators.length, depositAttribution.depositor_eoas, ownerCorrelation);
 
+  var operatorType = depositAttribution.depositor_eoas.length > 100 ? "pooled_protocol" : "single_operator_like";
+
   var result = {
     withdrawal_address: address,
     validators_found: validators.length,
     withdrawal_type: withdrawalType,
+    operator_type: operatorType,
     deposit_attribution: depositAttribution,
     suspected_operator: inference.suspected_operator,
     pattern: inference.pattern,
