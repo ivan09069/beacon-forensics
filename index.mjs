@@ -260,21 +260,45 @@ async function countValidatorsForSafe(safeAddr) {
 }
 
 // ─── Operator heuristics ─────────────────────────────────────────────────────
-function inferOperator(safe, validatorCount, depositorEoas) {
-  var base = 0.3;
+function inferOperator(safe, validatorCount, depositorEoas, ownerCorrelation) {
   var pattern = "unknown";
   var operator = "unknown";
+  var breakdown = {
+    safe_detected: 0,
+    validator_cohort_mapped: 0,
+    depositor_attributed: 0,
+    exact_owner_set_cluster: 0,
+    evidence_complete: 0,
+    total: 0,
+  };
+
   if (safe) {
-    base = 0.5;
+    breakdown.safe_detected = 0.2;
     pattern = "multisig_withdrawal";
     operator = "institutional_unknown";
-    if (safe.owners.length >= 4 && safe.threshold >= 2) { base = 0.7; pattern = "managed_multisig"; }
-    if (safe.owners.length === 6 && safe.threshold === 3 && validatorCount >= 20) { base = 0.85; pattern = "staking-as-a-service"; operator = "unlabeled_institutional"; }
-  } else {
-    pattern = "eoa_withdrawal";
+    if (safe.owners.length >= 4 && safe.threshold >= 2) { pattern = "managed_multisig"; }
+    if (safe.owners.length === 6 && safe.threshold === 3) { pattern = "staking-as-a-service"; operator = "unlabeled_institutional"; }
   }
-  if (depositorEoas.length > 0) { base = Math.min(base + 0.06, 0.95); }
-  return { suspected_operator: operator, pattern: pattern, confidence: Math.round(base * 100) / 100 };
+
+  if (validatorCount >= 20) { breakdown.validator_cohort_mapped = 0.2; }
+  else if (validatorCount >= 5) { breakdown.validator_cohort_mapped = 0.1; }
+  else if (validatorCount >= 1) { breakdown.validator_cohort_mapped = 0.05; }
+
+  if (depositorEoas.length > 0) { breakdown.depositor_attributed = 0.2; }
+
+  if (ownerCorrelation && ownerCorrelation.exact_owner_set_matches > 0) {
+    breakdown.exact_owner_set_cluster = 0.2;
+  }
+
+  // Evidence complete = all four signals present
+  var signals = [breakdown.safe_detected, breakdown.validator_cohort_mapped, breakdown.depositor_attributed, breakdown.exact_owner_set_cluster];
+  var present = signals.filter(function(s) { return s > 0; }).length;
+  if (present === 4) { breakdown.evidence_complete = 0.11; }
+  else if (present === 3) { breakdown.evidence_complete = 0.05; }
+
+  breakdown.total = Math.round((breakdown.safe_detected + breakdown.validator_cohort_mapped + breakdown.depositor_attributed + breakdown.exact_owner_set_cluster + breakdown.evidence_complete) * 100) / 100;
+
+  return { suspected_operator: operator, pattern: pattern, confidence: breakdown.total, confidence_breakdown: breakdown };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -397,7 +421,7 @@ async function main() {
     depositAttribution.query = manualQuery;
   }
 
-  var inference = inferOperator(safe, validators.length, depositAttribution.depositor_eoas);
+  var inference = inferOperator(safe, validators.length, depositAttribution.depositor_eoas, ownerCorrelation);
 
   var result = {
     withdrawal_address: address,
@@ -407,6 +431,7 @@ async function main() {
     suspected_operator: inference.suspected_operator,
     pattern: inference.pattern,
     confidence: inference.confidence,
+    confidence_breakdown: inference.confidence_breakdown,
     validators: validators.map(function(v) {
       return { index: v.index, status: v.status, withdrawal_count: v.withdrawal_count, total_withdrawn: v.total_withdrawn };
     }),
