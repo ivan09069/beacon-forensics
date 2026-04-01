@@ -194,6 +194,70 @@ async function getDepositorCluster(address) {
   return depositors;
 }
 
+// ─── Cross-Safe owner correlation ────────────────────────────────────────────
+var SAFE_TX_API = "https://safe-transaction-mainnet.safe.global/api/v1";
+
+async function getChecksumAddress(addr) {
+  try {
+    var url = BLOCKSCOUT + "/api/v2/addresses/" + addr.toLowerCase();
+    var r = await fetch(url);
+    if (!r.ok) return addr;
+    var d = await r.json();
+    return d.hash || addr;
+  } catch (e) { return addr; }
+}
+
+async function getSafesForOwner(checksumAddr) {
+  try {
+    var url = SAFE_TX_API + "/owners/" + checksumAddr + "/safes/";
+    var r = await fetch(url);
+    if (!r.ok) return [];
+    var d = await r.json();
+    return d.safes || [];
+  } catch (e) { return []; }
+}
+
+async function correlateOwners(owners, currentSafe) {
+  // Get checksummed addresses
+  var checksummed = [];
+  for (var i = 0; i < owners.length; i++) {
+    checksummed.push(await getChecksumAddress(owners[i]));
+  }
+  // Get Safes for first owner, then intersect with others
+  process.stderr.write("  Owner 1/" + owners.length + "...\n");
+  var candidate = await getSafesForOwner(checksummed[0]);
+  var candidateSet = {};
+  for (var j = 0; j < candidate.length; j++) candidateSet[candidate[j].toLowerCase()] = 1;
+
+  for (var k = 1; k < checksummed.length; k++) {
+    process.stderr.write("  Owner " + (k + 1) + "/" + owners.length + "...\n");
+    var safes = await getSafesForOwner(checksummed[k]);
+    var safeSet = {};
+    for (var m = 0; m < safes.length; m++) safeSet[safes[m].toLowerCase()] = 1;
+    // Intersect
+    for (var addr in candidateSet) {
+      if (!safeSet[addr]) delete candidateSet[addr];
+    }
+  }
+  // Remove the current Safe from results
+  delete candidateSet[currentSafe.toLowerCase()];
+  return Object.keys(candidateSet);
+}
+
+async function countValidatorsForSafe(safeAddr) {
+  try {
+    var url = BLOCKSCOUT + "/api/v2/addresses/" + safeAddr.toLowerCase() + "/withdrawals";
+    var d = await fetchJSON(url);
+    var items = d.items || [];
+    var seen = {};
+    for (var i = 0; i < items.length; i++) {
+      var idx = items[i].validator_index;
+      if (idx !== undefined) seen[idx] = 1;
+    }
+    return Object.keys(seen).length;
+  } catch (e) { return 0; }
+}
+
 // ─── Operator heuristics ─────────────────────────────────────────────────────
 function inferOperator(safe, validatorCount, depositorEoas) {
   var base = 0.3;
@@ -234,6 +298,33 @@ async function main() {
   process.stderr.write("Found " + validators.length + " validators. Checking Safe...\n");
   var safe = await detectSafe(address);
   var withdrawalType = safe ? "gnosis_safe" : "eoa";
+
+  // Cross-Safe owner correlation
+  var ownerCorrelation = null;
+  if (safe && safe.owners.length > 0) {
+    process.stderr.write("Correlating Safe owners...\n");
+    try {
+      var matchedSafes = await correlateOwners(safe.owners, address);
+      if (matchedSafes.length > 0) {
+        var correlatedValidators = 0;
+        var correlatedAddresses = [];
+        for (var si = 0; si < matchedSafes.length; si++) {
+          var vc = await countValidatorsForSafe(matchedSafes[si]);
+          if (vc > 0) {
+            correlatedAddresses.push(matchedSafes[si]);
+            correlatedValidators += vc;
+          }
+        }
+        ownerCorrelation = {
+          owners: safe.owners,
+          matching_safes_found: matchedSafes.length,
+          correlated_withdrawal_addresses: correlatedAddresses,
+          correlated_validator_count: correlatedValidators,
+        };
+        process.stderr.write("  " + matchedSafes.length + " matching Safes, " + correlatedAddresses.length + " with validators (" + correlatedValidators + " total)\n");
+      }
+    } catch (e) { /* continue without correlation */ }
+  }
 
   process.stderr.write("Resolving depositors...\n");
   var addrClean = address.toLowerCase().replace("0x", "");
@@ -317,6 +408,10 @@ async function main() {
       owner_count: safe.owners.length,
       owners: safe.owners,
     };
+  }
+
+  if (ownerCorrelation) {
+    result.owner_correlation = ownerCorrelation;
   }
 
   console.log(JSON.stringify(result, null, 2));
