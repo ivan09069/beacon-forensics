@@ -1,11 +1,22 @@
 # beacon-forensics
 
-CLI tool for Ethereum validator cluster attribution. Given a withdrawal address, identifies the validator cohort, detects Safe/multisig control structures, and infers operator patterns.
+CLI tool for Ethereum validator cluster attribution. Given a withdrawal address, identifies the validator cohort, detects Safe/multisig control structures, traces depositors, and infers operator patterns.
 
 ## Usage
 
 ```bash
 node index.mjs lookup --withdrawal <address>
+node index.mjs lookup --withdrawal <address> --depositor <depositor_eoa>
+```
+
+## Deposit Attribution
+
+The `--depositor` flag accepts a BQ-verified depositor address. The tool verifies it against the Beacon Deposit Contract on-chain.
+
+Without `--depositor`, the tool attempts chain-tracing (Safe funding sources → deposit contract check). If that fails, the output includes a ready-to-run BigQuery query:
+
+```bash
+bq query --use_legacy_sql=false '<query from output>'
 ```
 
 ## Example

@@ -106,44 +106,79 @@ async function getValidatorsByWithdrawal(address) {
   return validators;
 }
 
-// ─── Depositor lookup via Blockscout ─────────────────────────────────────────
+// ─── Depositor clustering via chain trace ────────────────────────────────────
+var DEPOSIT_CONTRACT = "0x00000000219ab540356cbb839cbe05303d7705fa";
+
 async function getDepositorCluster(address) {
-  // Check internal txs TO the beacon deposit contract FROM this withdrawal address's funding chain
-  // Simpler: check Blockscout for the withdrawal address's funding history
-  var url = BLOCKSCOUT + "/api/v2/addresses/" + address + "/transactions?filter=to%7Cfrom";
+  var addr = address.toLowerCase();
+  // Step 1: Find who funded the withdrawal address (Safe or EOA)
+  var txUrl = BLOCKSCOUT + "/api/v2/addresses/" + addr + "/transactions";
+  var funders = {};
   try {
-    var d = await fetchJSON(url);
-    var depositors = {};
+    var d = await fetchJSON(txUrl);
     var items = d.items || [];
     for (var i = 0; i < items.length; i++) {
       var tx = items[i];
       var from = tx.from && tx.from.hash;
-      if (from && from.toLowerCase() !== address.toLowerCase()) {
-        depositors[from.toLowerCase()] = (depositors[from.toLowerCase()] || 0) + 1;
+      var to = tx.to && tx.to.hash;
+      // Inbound ETH transfers to our address
+      if (to && to.toLowerCase() === addr && from) {
+        var f = from.toLowerCase();
+        funders[f] = (funders[f] || 0) + 1;
       }
     }
-    return Object.keys(depositors).sort(function(a, b) { return depositors[b] - depositors[a]; });
-  } catch (e) { return []; }
+  } catch (e) { /* continue with empty funders */ }
+
+  // Step 2: For each funder, check if they deposited to the Beacon Deposit Contract
+  var depositors = [];
+  var funderList = Object.keys(funders);
+  for (var j = 0; j < funderList.length; j++) {
+    var funder = funderList[j];
+    try {
+      var depUrl = BLOCKSCOUT + "/api/v2/addresses/" + funder + "/transactions?filter=to";
+      var depData = await fetchJSON(depUrl);
+      var depItems = depData.items || [];
+      var depositCount = 0;
+      var depositEth = 0;
+      for (var k = 0; k < depItems.length; k++) {
+        var dtx = depItems[k];
+        var dTo = dtx.to && dtx.to.hash;
+        if (dTo && dTo.toLowerCase() === DEPOSIT_CONTRACT) {
+          depositCount++;
+          var val = dtx.value || "0";
+          depositEth += parseInt(val) / 1e18;
+        }
+      }
+      if (depositCount > 0) {
+        depositors.push({ address: funder, deposit_count: depositCount, total_eth: depositEth });
+      }
+    } catch (e) { continue; }
+  }
+  // Also check funders' funders (one hop back) for treasury detection
+  // Skip for v0.2.0 — direct funders are sufficient
+  depositors.sort(function(a, b) { return b.deposit_count - a.deposit_count; });
+  return depositors;
 }
 
 // ─── Operator heuristics ─────────────────────────────────────────────────────
 function inferOperator(safe, validatorCount, depositors) {
-  if (!safe) {
-    return { suspected_operator: "unknown", pattern: "eoa_withdrawal", confidence: 0.3 };
+  var base = 0.3;
+  var pattern = "unknown";
+  var operator = "unknown";
+  if (safe) {
+    base = 0.5;
+    pattern = "multisig_withdrawal";
+    operator = "institutional_unknown";
+    if (safe.owners.length >= 4 && safe.threshold >= 2) { base = 0.7; pattern = "managed_multisig"; }
+    if (safe.owners.length === 6 && safe.threshold === 3 && validatorCount >= 20) { base = 0.85; pattern = "staking-as-a-service"; operator = "unlabeled_institutional"; }
+  } else {
+    pattern = "eoa_withdrawal";
   }
-  var ownerCount = safe.owners.length;
-  var threshold = safe.threshold;
-  // Known patterns
-  if (ownerCount === 6 && threshold === 3 && validatorCount >= 20) {
-    return { suspected_operator: "unlabeled_institutional", pattern: "staking-as-a-service", confidence: 0.85 };
+  // Depositor data raises confidence
+  if (depositors.length > 0 && depositors[0].deposit_count >= 10) {
+    base = Math.min(base + 0.06, 0.95);
   }
-  if (ownerCount >= 4 && threshold >= 2) {
-    return { suspected_operator: "institutional_unknown", pattern: "managed_multisig", confidence: 0.7 };
-  }
-  if (ownerCount <= 2) {
-    return { suspected_operator: "individual_or_small_team", pattern: "self_custody", confidence: 0.5 };
-  }
-  return { suspected_operator: "unknown", pattern: "multisig_withdrawal", confidence: 0.4 };
+  return { suspected_operator: operator, pattern: pattern, confidence: base };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -155,6 +190,12 @@ async function main() {
   var address = args[2];
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) die("Invalid address: " + address);
 
+  // Optional: --depositor flag for BQ-verified depositor
+  var knownDepositor = null;
+  for (var a = 3; a < args.length; a++) {
+    if (args[a] === "--depositor" && args[a + 1]) knownDepositor = args[a + 1];
+  }
+
   process.stderr.write("Fetching validators...\n");
   var validators = await getValidatorsByWithdrawal(address);
   if (!validators.length) die("No validators found for withdrawal address " + address);
@@ -163,8 +204,41 @@ async function main() {
   var safe = await detectSafe(address);
   var withdrawalType = safe ? "gnosis_safe" : "eoa";
 
-  process.stderr.write("Getting depositor cluster...\n");
-  var depositors = await getDepositorCluster(address);
+  process.stderr.write("Tracing depositors...\n");
+  var depositors = [];
+  var depositMethod = "none";
+  if (knownDepositor) {
+    // BQ-verified depositor provided via flag
+    depositors = [{ address: knownDepositor.toLowerCase(), deposit_count: -1, total_eth: -1, source: "user_provided" }];
+    // Verify against deposit contract via Blockscout
+    try {
+      var depUrl = BLOCKSCOUT + "/api/v2/addresses/" + knownDepositor.toLowerCase() + "/transactions";
+      var depData = await fetchJSON(depUrl);
+      var depItems = depData.items || [];
+      var dCount = 0;
+      var dEth = 0;
+      for (var di = 0; di < depItems.length; di++) {
+        var dtx = depItems[di];
+        var dTo = dtx.to && dtx.to.hash;
+        if (dTo && dTo.toLowerCase() === DEPOSIT_CONTRACT) {
+          dCount++;
+          dEth += parseInt(dtx.value || "0") / 1e18;
+        }
+      }
+      if (dCount > 0) {
+        depositors = [{ address: knownDepositor.toLowerCase(), deposit_count: dCount, total_eth: dEth, source: "verified_onchain" }];
+        depositMethod = "flag_verified";
+      } else {
+        depositMethod = "flag_unverified";
+      }
+    } catch (e) { depositMethod = "flag_unverified"; }
+  } else {
+    depositors = await getDepositorCluster(address);
+    depositMethod = depositors.length > 0 ? "chain_trace" : "none";
+  }
+
+  var addrClean = address.toLowerCase().replace("0x", "");
+  var bqQuery = "SELECT t.from_address as depositor, COUNT(*) as deposit_count, SUM(CAST(t.value AS FLOAT64)/1e18) as total_eth FROM `bigquery-public-data.crypto_ethereum.logs` l JOIN `bigquery-public-data.crypto_ethereum.transactions` t ON l.transaction_hash = t.hash AND l.block_number = t.block_number WHERE l.address = '0x00000000219ab540356cbb839cbe05303d7705fa' AND LOWER(l.data) LIKE '%" + addrClean + "%' GROUP BY depositor ORDER BY deposit_count DESC";
 
   var inference = inferOperator(safe, validators.length, depositors);
 
@@ -172,7 +246,14 @@ async function main() {
     withdrawal_address: address,
     validators_found: validators.length,
     withdrawal_type: withdrawalType,
-    depositor_cluster: depositors.slice(0, 10),
+    deposit_attribution: {
+      method: depositMethod,
+      depositor_eoas: depositors.map(function(d) { return d.address; }),
+      deposit_count_matched: depositors.reduce(function(s, d) { return s + (d.deposit_count > 0 ? d.deposit_count : 0); }, 0),
+      total_eth_deposited: depositors.reduce(function(s, d) { return s + (d.total_eth > 0 ? d.total_eth : 0); }, 0),
+      depositors: depositors,
+      bq_query: depositMethod === "none" ? bqQuery : undefined,
+    },
     suspected_operator: inference.suspected_operator,
     pattern: inference.pattern,
     confidence: inference.confidence,
