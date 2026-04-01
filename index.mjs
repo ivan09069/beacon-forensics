@@ -326,6 +326,7 @@ async function main() {
           matching_safes_found: totalMatched,
           exact_owner_set_matches: exactCount,
           partial_overlap_matches: partialCount,
+          exact_match_safe_addresses: corr.exact,
           correlated_withdrawal_addresses: exactWithdrawalAddrs,
           correlated_validator_count: exactValidators,
           partial_overlaps: corr.partial.slice(0, 10),
@@ -426,6 +427,12 @@ async function main() {
       exact_match_withdrawal_addresses: ownerCorrelation.correlated_withdrawal_addresses.length,
       exact_match_validators: ownerCorrelation.correlated_validator_count + validators.length,
       estimated_staked_eth: (ownerCorrelation.correlated_validator_count + validators.length) * 32,
+    };
+    result.evidence = {
+      query_safe: address,
+      exact_match_safe_addresses: ownerCorrelation.exact_match_safe_addresses,
+      exact_match_withdrawal_addresses: ownerCorrelation.correlated_withdrawal_addresses,
+      depositor_eoas: depositAttribution.depositor_eoas,
     };
   }
 
