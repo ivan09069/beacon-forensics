@@ -218,30 +218,31 @@ async function getSafesForOwner(checksumAddr) {
 }
 
 async function correlateOwners(owners, currentSafe) {
-  // Get checksummed addresses
   var checksummed = [];
   for (var i = 0; i < owners.length; i++) {
     checksummed.push(await getChecksumAddress(owners[i]));
   }
-  // Get Safes for first owner, then intersect with others
-  process.stderr.write("  Owner 1/" + owners.length + "...\n");
-  var candidate = await getSafesForOwner(checksummed[0]);
-  var candidateSet = {};
-  for (var j = 0; j < candidate.length; j++) candidateSet[candidate[j].toLowerCase()] = 1;
-
-  for (var k = 1; k < checksummed.length; k++) {
+  // Collect all Safes per owner, count how many owners each Safe appears in
+  var safeCounts = {}; // safeAddr → count of owners
+  for (var k = 0; k < checksummed.length; k++) {
     process.stderr.write("  Owner " + (k + 1) + "/" + owners.length + "...\n");
     var safes = await getSafesForOwner(checksummed[k]);
-    var safeSet = {};
-    for (var m = 0; m < safes.length; m++) safeSet[safes[m].toLowerCase()] = 1;
-    // Intersect
-    for (var addr in candidateSet) {
-      if (!safeSet[addr]) delete candidateSet[addr];
+    for (var m = 0; m < safes.length; m++) {
+      var s = safes[m].toLowerCase();
+      safeCounts[s] = (safeCounts[s] || 0) + 1;
     }
   }
-  // Remove the current Safe from results
-  delete candidateSet[currentSafe.toLowerCase()];
-  return Object.keys(candidateSet);
+  delete safeCounts[currentSafe.toLowerCase()];
+  // Classify: exact = all owners present, partial = 2+ but not all
+  var ownerCount = owners.length;
+  var exact = [];
+  var partial = [];
+  for (var addr in safeCounts) {
+    if (safeCounts[addr] === ownerCount) exact.push(addr);
+    else if (safeCounts[addr] >= 2) partial.push({ address: addr, overlap: safeCounts[addr] });
+  }
+  partial.sort(function(a, b) { return b.overlap - a.overlap; });
+  return { exact: exact, partial: partial };
 }
 
 async function countValidatorsForSafe(safeAddr) {
@@ -304,24 +305,32 @@ async function main() {
   if (safe && safe.owners.length > 0) {
     process.stderr.write("Correlating Safe owners...\n");
     try {
-      var matchedSafes = await correlateOwners(safe.owners, address);
-      if (matchedSafes.length > 0) {
-        var correlatedValidators = 0;
-        var correlatedAddresses = [];
-        for (var si = 0; si < matchedSafes.length; si++) {
-          var vc = await countValidatorsForSafe(matchedSafes[si]);
+      var corr = await correlateOwners(safe.owners, address);
+      var exactCount = corr.exact.length;
+      var partialCount = corr.partial.length;
+      var totalMatched = exactCount + partialCount;
+      if (totalMatched > 0) {
+        // Count validators for exact-match Safes only
+        var exactValidators = 0;
+        var exactWithdrawalAddrs = [];
+        process.stderr.write("  Checking " + exactCount + " exact-match Safes for validators...\n");
+        for (var si = 0; si < corr.exact.length; si++) {
+          var vc = await countValidatorsForSafe(corr.exact[si]);
           if (vc > 0) {
-            correlatedAddresses.push(matchedSafes[si]);
-            correlatedValidators += vc;
+            exactWithdrawalAddrs.push(corr.exact[si]);
+            exactValidators += vc;
           }
         }
         ownerCorrelation = {
           owners: safe.owners,
-          matching_safes_found: matchedSafes.length,
-          correlated_withdrawal_addresses: correlatedAddresses,
-          correlated_validator_count: correlatedValidators,
+          matching_safes_found: totalMatched,
+          exact_owner_set_matches: exactCount,
+          partial_overlap_matches: partialCount,
+          correlated_withdrawal_addresses: exactWithdrawalAddrs,
+          correlated_validator_count: exactValidators,
+          partial_overlaps: corr.partial.slice(0, 10),
         };
-        process.stderr.write("  " + matchedSafes.length + " matching Safes, " + correlatedAddresses.length + " with validators (" + correlatedValidators + " total)\n");
+        process.stderr.write("  exact=" + exactCount + " partial=" + partialCount + " validators=" + exactValidators + "\n");
       }
     } catch (e) { /* continue without correlation */ }
   }
