@@ -1,83 +1,131 @@
 # beacon-forensics
 
-CLI tool for Ethereum validator cluster attribution. Given a withdrawal address, identifies the validator cohort, detects Safe/multisig control structures, traces depositors, and infers operator patterns.
+CLI tool that maps an Ethereum validator operator's full infrastructure from a single withdrawal address.
 
-## Usage
+Given one address, it identifies the validator cohort, detects Gnosis Safe multisig control, attributes the depositor via BigQuery, clusters sibling Safes by owner set, and quantifies the operator's total staked footprint.
 
-```bash
-node index.mjs lookup --withdrawal <address>
-node index.mjs lookup --withdrawal <address> --depositor <depositor_eoa>
-```
-
-## Deposit Attribution
-
-The `--depositor` flag accepts a BQ-verified depositor address. The tool verifies it against the Beacon Deposit Contract on-chain.
-
-Without `--depositor`, the tool attempts chain-tracing (Safe funding sources → deposit contract check). If that fails, the output includes a ready-to-run BigQuery query:
-
-```bash
-bq query --use_legacy_sql=false '<query from output>'
-```
-
-## Example
+## Quick Start
 
 ```bash
 node index.mjs lookup --withdrawal 0x13EFE153D837721CBC8C0EF9735C4C65F4A947D9
 ```
 
-## Output
+## What It Does
+
+```
+withdrawal address
+  → Safe detection (threshold, owners)
+  → validator cohort (via Blockscout withdrawals)
+  → depositor attribution (via BigQuery)
+  → sibling Safe clustering (via Safe Transaction Service)
+  → exact vs partial owner-set classification
+  → operator footprint rollup
+```
+
+## Sample Output (JSON)
 
 ```json
 {
-  "withdrawal_address": "0x13EFE153...",
   "validators_found": 23,
   "withdrawal_type": "gnosis_safe",
-  "depositor_cluster": [],
-  "suspected_operator": "unlabeled_institutional",
-  "pattern": "staking-as-a-service",
-  "confidence": 0.85,
-  "validators": [
-    { "index": 2236975, "status": "active", "withdrawal_count": 1, "total_withdrawn": 0.002242 }
-  ],
-  "safe": {
-    "threshold": 3,
-    "owner_count": 6,
-    "owners": ["0x82b9...", "0xe553...", "0x351d...", "0x07d9...", "0x8219...", "0x03e7..."]
-  }
+  "deposit_attribution": {
+    "method": "bigquery_live",
+    "depositor_eoas": ["0x5a436013386f7d60b965e8ece3113036aa3cf212"],
+    "deposit_count_matched": 40,
+    "total_eth_deposited": 1280
+  },
+  "cluster_summary": {
+    "exact_match_safes": 47,
+    "exact_match_withdrawal_addresses": 24,
+    "exact_match_validators": 788,
+    "estimated_staked_eth": 25216
+  },
+  "confidence": 0.91,
+  "confidence_breakdown": {
+    "safe_detected": 0.2,
+    "validator_cohort_mapped": 0.2,
+    "depositor_attributed": 0.2,
+    "exact_owner_set_cluster": 0.2,
+    "evidence_complete": 0.11,
+    "total": 0.91
+  },
+  "safe": { "threshold": 3, "owner_count": 6 }
 }
 ```
 
-## What it does
+## Markdown Report
 
-1. Queries Blockscout V2 for all beacon chain withdrawals to the given address
-2. Deduplicates by validator index, counts withdrawal events per validator
-3. Calls `getOwners()` and `getThreshold()` on the address to detect Gnosis Safe
-4. Infers operator type from Safe configuration and validator count
+```bash
+node index.mjs lookup --withdrawal 0x13EFE153... --format markdown
+```
 
-## Data sources
+Produces a structured report with Summary, Cluster Summary, Deposit Attribution, Evidence, Confidence Breakdown, Safe Configuration, and Limitations — directly publishable to GitHub or a gist.
 
-- **Blockscout V2** — withdrawal events, transaction history (free, no key)
-- **Ethereum JSON-RPC** — Safe contract calls via publicnode.com
+## What This Proves
 
-## Heuristics
+- **Withdrawal control**: Which multisig (owners, threshold) controls the withdrawal address
+- **Validator cohort**: How many validators use this withdrawal address
+- **Deposit-side attribution**: Which EOA deposited to the Beacon Deposit Contract for these validators
+- **Operator scale**: How many sibling Safes share the exact same owner set, and how many total validators they control
+- **Evidence chain**: Every address backing the claim is listed in the output
 
-| Pattern | Trigger | Confidence |
-|---------|---------|------------|
-| `staking-as-a-service` | 6-owner 3-of-6 Safe, 20+ validators | 0.85 |
-| `managed_multisig` | 4+ owners, threshold >= 2 | 0.70 |
-| `self_custody` | 1-2 owners | 0.50 |
-| `eoa_withdrawal` | No Safe detected | 0.30 |
+## What It Does Not Prove
 
-## Limitations
+- **Validator signing-key custody**: Withdrawal credentials prove fund destination, not who runs the validator software
+- **Operator legal identity**: The tool identifies on-chain patterns, not entities
+- **Completeness**: Blockscout withdrawal pagination may undercount; BigQuery provides full deposit counts
+- **Partial-overlap attribution**: Safes sharing only some owners are reported but excluded from cluster counts
 
-- `depositor_cluster` not yet populated (requires beacon deposit contract event tracing)
-- beaconcha.in API requires auth; currently uses Blockscout withdrawals only
-- No validator pubkey or balance data (Blockscout withdrawals don't include these)
-- Heuristics are pattern-based, not identity-verified
+## Data Sources
 
-## Roadmap
+| Source | Purpose | Key Required |
+|---|---|---|
+| Blockscout V2 | Withdrawals, transactions | No |
+| Ethereum JSON-RPC | Safe contract calls | No |
+| Safe Transaction Service | Owner-to-Safe mapping | No |
+| BigQuery (public dataset) | Deposit contract event matching | gcloud auth |
 
-- Deposit contract event tracing for depositor attribution
-- BigQuery integration for bulk validator analysis
-- Cross-Safe owner correlation
-- MEV builder/relay attribution
+## Prerequisites
+
+- Node.js 20+
+- `gcloud auth login` (for BigQuery depositor attribution)
+- `gcloud config set project <your-project-id>`
+
+Without gcloud, all features work except depositor attribution — the tool emits a ready-to-run BQ query instead.
+
+## Options
+
+```
+node index.mjs lookup --withdrawal <address>              # JSON output
+node index.mjs lookup --withdrawal <address> --format markdown  # Report output
+node index.mjs lookup --withdrawal <address> --depositor <eoa>  # Manual depositor override
+```
+
+## Canonical Case Study
+
+**Input:** One Gnosis Safe withdrawal address (`0x13EFE153...`)
+
+**Discovery chain:**
+1. 23 validators identified via Blockscout beacon withdrawals
+2. 3-of-6 Gnosis Safe detected via on-chain `getOwners()` / `getThreshold()`
+3. Depositor `0x5a4360...` attributed via BigQuery (40 deposits, 1,280 ETH)
+4. 47 sibling Safes found via Safe Transaction Service owner correlation
+5. 24 of those Safes serve as validator withdrawal addresses
+6. **788 total validators, ~25,216 staked ETH** across the operator cluster
+
+**Conclusion:** An unlabeled institutional staking operation using a consistent 6-person 3-of-6 multisig structure across 47+ Safes, managing ~$75M in staked ETH.
+
+## Version History
+
+| Version | Feature |
+|---|---|
+| v0.1.0 | Validator lookup + Safe detection |
+| v0.2.0 | Depositor flag + Blockscout verification |
+| v0.3.0 | Programmatic BigQuery depositor attribution |
+| v0.4.0 | Cross-Safe owner correlation |
+| v0.5.0 | Exact vs partial owner-set classification |
+| v0.6.0 | Cluster summary rollup |
+| v0.7.0 | Evidence block |
+| v0.8.0 | Confidence breakdown |
+| v0.9.0 | Markdown report export |
+| v1.0.0 | README case study + repo positioning |
