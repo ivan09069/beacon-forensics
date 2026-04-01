@@ -7,6 +7,7 @@
  * Usage: node index.mjs lookup --withdrawal <address>
  */
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 
 var RPC = "https://ethereum-rpc.publicnode.com";
 var BEACONCHA = "https://beaconcha.in/api/v1";
@@ -108,6 +109,39 @@ async function getValidatorsByWithdrawal(address) {
 
 // ─── Depositor clustering via chain trace ────────────────────────────────────
 var DEPOSIT_CONTRACT = "0x00000000219ab540356cbb839cbe05303d7705fa";
+var BQ_PROJECT = "astute-baton-471810-g6";
+
+async function bqDepositorQuery(address) {
+  var addrClean = address.toLowerCase().replace("0x", "");
+  try {
+    var token = execSync("gcloud auth print-access-token", { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "ignore"] }).trim();
+    if (!token || token.length < 20) return null;
+    var sql = "SELECT t.from_address as depositor, COUNT(*) as deposit_count, " +
+      "CAST(SUM(CAST(t.value AS FLOAT64)/1e18) AS FLOAT64) as total_eth " +
+      "FROM `bigquery-public-data.crypto_ethereum.logs` l " +
+      "JOIN `bigquery-public-data.crypto_ethereum.transactions` t " +
+      "ON l.transaction_hash = t.hash AND l.block_number = t.block_number " +
+      "WHERE l.address = '0x00000000219ab540356cbb839cbe05303d7705fa' " +
+      "AND LOWER(l.data) LIKE '%" + addrClean + "%' " +
+      "GROUP BY depositor ORDER BY deposit_count DESC";
+    var url = "https://bigquery.googleapis.com/bigquery/v2/projects/" + BQ_PROJECT + "/queries";
+    var r = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: sql, useLegacySql: false, timeoutMs: 120000 }),
+    });
+    var d = await r.json();
+    if (d.error || !d.jobComplete || !d.rows) return null;
+    return d.rows.map(function(row) {
+      return {
+        address: row.f[0].v,
+        deposit_count: parseInt(row.f[1].v),
+        total_eth: parseFloat(row.f[2].v),
+        source: "bigquery",
+      };
+    });
+  } catch (e) { return null; }
+}
 
 async function getDepositorCluster(address) {
   var addr = address.toLowerCase();
@@ -161,7 +195,7 @@ async function getDepositorCluster(address) {
 }
 
 // ─── Operator heuristics ─────────────────────────────────────────────────────
-function inferOperator(safe, validatorCount, depositors) {
+function inferOperator(safe, validatorCount, depositorEoas) {
   var base = 0.3;
   var pattern = "unknown";
   var operator = "unknown";
@@ -174,11 +208,8 @@ function inferOperator(safe, validatorCount, depositors) {
   } else {
     pattern = "eoa_withdrawal";
   }
-  // Depositor data raises confidence
-  if (depositors.length > 0 && depositors[0].deposit_count >= 10) {
-    base = Math.min(base + 0.06, 0.95);
-  }
-  return { suspected_operator: operator, pattern: pattern, confidence: base };
+  if (depositorEoas.length > 0) { base = Math.min(base + 0.06, 0.95); }
+  return { suspected_operator: operator, pattern: pattern, confidence: Math.round(base * 100) / 100 };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -204,56 +235,74 @@ async function main() {
   var safe = await detectSafe(address);
   var withdrawalType = safe ? "gnosis_safe" : "eoa";
 
-  process.stderr.write("Tracing depositors...\n");
-  var depositors = [];
-  var depositMethod = "none";
-  if (knownDepositor) {
-    // BQ-verified depositor provided via flag
-    depositors = [{ address: knownDepositor.toLowerCase(), deposit_count: -1, total_eth: -1, source: "user_provided" }];
-    // Verify against deposit contract via Blockscout
+  process.stderr.write("Resolving depositors...\n");
+  var addrClean = address.toLowerCase().replace("0x", "");
+  var manualQuery = "SELECT t.from_address as depositor, COUNT(*) as deposit_count, SUM(CAST(t.value AS FLOAT64)/1e18) as total_eth FROM `bigquery-public-data.crypto_ethereum.logs` l JOIN `bigquery-public-data.crypto_ethereum.transactions` t ON l.transaction_hash = t.hash AND l.block_number = t.block_number WHERE l.address = '0x00000000219ab540356cbb839cbe05303d7705fa' AND LOWER(l.data) LIKE '%" + addrClean + "%' GROUP BY depositor ORDER BY deposit_count DESC";
+
+  var depositAttribution = {
+    method: "unresolved",
+    depositor_eoas: [],
+    deposit_count_matched: 0,
+    total_eth_deposited: 0,
+    query: null,
+  };
+
+  // 1. BigQuery live
+  try {
+    process.stderr.write("  Trying BigQuery...\n");
+    var bqResult = await bqDepositorQuery(address);
+    if (bqResult && bqResult.length > 0) {
+      depositAttribution = {
+        method: "bigquery_live",
+        depositor_eoas: bqResult.map(function(d) { return d.address; }),
+        deposit_count_matched: bqResult.reduce(function(s, d) { return s + d.deposit_count; }, 0),
+        total_eth_deposited: bqResult.reduce(function(s, d) { return s + d.total_eth; }, 0),
+        query: null,
+      };
+      process.stderr.write("  BQ resolved: " + depositAttribution.depositor_eoas.length + " depositor(s)\n");
+    }
+  } catch (e) { /* keep going */ }
+
+  // 2. Chain-trace fallback
+  if (!depositAttribution.depositor_eoas.length) {
     try {
-      var depUrl = BLOCKSCOUT + "/api/v2/addresses/" + knownDepositor.toLowerCase() + "/transactions";
-      var depData = await fetchJSON(depUrl);
-      var depItems = depData.items || [];
-      var dCount = 0;
-      var dEth = 0;
-      for (var di = 0; di < depItems.length; di++) {
-        var dtx = depItems[di];
-        var dTo = dtx.to && dtx.to.hash;
-        if (dTo && dTo.toLowerCase() === DEPOSIT_CONTRACT) {
-          dCount++;
-          dEth += parseInt(dtx.value || "0") / 1e18;
-        }
+      process.stderr.write("  Trying chain trace...\n");
+      var traced = await getDepositorCluster(address);
+      if (traced && traced.length > 0) {
+        depositAttribution = {
+          method: "chain_trace",
+          depositor_eoas: traced.map(function(d) { return d.address; }),
+          deposit_count_matched: traced.reduce(function(s, d) { return s + d.deposit_count; }, 0),
+          total_eth_deposited: traced.reduce(function(s, d) { return s + d.total_eth; }, 0),
+          query: null,
+        };
       }
-      if (dCount > 0) {
-        depositors = [{ address: knownDepositor.toLowerCase(), deposit_count: dCount, total_eth: dEth, source: "verified_onchain" }];
-        depositMethod = "flag_verified";
-      } else {
-        depositMethod = "flag_unverified";
-      }
-    } catch (e) { depositMethod = "flag_unverified"; }
-  } else {
-    depositors = await getDepositorCluster(address);
-    depositMethod = depositors.length > 0 ? "chain_trace" : "none";
+    } catch (e) { /* keep going */ }
   }
 
-  var addrClean = address.toLowerCase().replace("0x", "");
-  var bqQuery = "SELECT t.from_address as depositor, COUNT(*) as deposit_count, SUM(CAST(t.value AS FLOAT64)/1e18) as total_eth FROM `bigquery-public-data.crypto_ethereum.logs` l JOIN `bigquery-public-data.crypto_ethereum.transactions` t ON l.transaction_hash = t.hash AND l.block_number = t.block_number WHERE l.address = '0x00000000219ab540356cbb839cbe05303d7705fa' AND LOWER(l.data) LIKE '%" + addrClean + "%' GROUP BY depositor ORDER BY deposit_count DESC";
+  // 3. Manual override via --depositor flag
+  if (!depositAttribution.depositor_eoas.length && knownDepositor) {
+    depositAttribution = {
+      method: "flag_override",
+      depositor_eoas: [knownDepositor.toLowerCase()],
+      deposit_count_matched: 0,
+      total_eth_deposited: 0,
+      query: null,
+    };
+  }
 
-  var inference = inferOperator(safe, validators.length, depositors);
+  // 4. Always include query if unresolved
+  if (depositAttribution.method === "unresolved") {
+    depositAttribution.query = manualQuery;
+  }
+
+  var inference = inferOperator(safe, validators.length, depositAttribution.depositor_eoas);
 
   var result = {
     withdrawal_address: address,
     validators_found: validators.length,
     withdrawal_type: withdrawalType,
-    deposit_attribution: {
-      method: depositMethod,
-      depositor_eoas: depositors.map(function(d) { return d.address; }),
-      deposit_count_matched: depositors.reduce(function(s, d) { return s + (d.deposit_count > 0 ? d.deposit_count : 0); }, 0),
-      total_eth_deposited: depositors.reduce(function(s, d) { return s + (d.total_eth > 0 ? d.total_eth : 0); }, 0),
-      depositors: depositors,
-      bq_query: depositMethod === "none" ? bqQuery : undefined,
-    },
+    deposit_attribution: depositAttribution,
     suspected_operator: inference.suspected_operator,
     pattern: inference.pattern,
     confidence: inference.confidence,
