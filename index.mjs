@@ -421,6 +421,12 @@ async function main() {
 
   if (ownerCorrelation) {
     result.owner_correlation = ownerCorrelation;
+    result.cluster_summary = {
+      exact_match_safes: ownerCorrelation.exact_owner_set_matches,
+      exact_match_withdrawal_addresses: ownerCorrelation.correlated_withdrawal_addresses.length,
+      exact_match_validators: ownerCorrelation.correlated_validator_count + validators.length,
+      estimated_staked_eth: (ownerCorrelation.correlated_validator_count + validators.length) * 32,
+    };
   }
 
   console.log(JSON.stringify(result, null, 2));
